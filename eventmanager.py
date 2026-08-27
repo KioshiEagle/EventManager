@@ -8,6 +8,8 @@ import re
 import time
 import html
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # 1. CONFIGURATION & STYLE
@@ -50,8 +52,9 @@ TYPE_COLORS = {
     "EXPOSITION": "#FFAD33", "CONCERT": "#E74C3C", "SPECTACLE": "#E74C3C",
     "SÉMINAIRE": "#3498DB", "CONFÉRENCE": "#3498DB", "ATELIER": "#2ECC71",
     "SPORT": "#9B59B6", "FORMATION": "#9B59B6", "AFTERWORK": "#E67E22", 
-    "SCIENCES": "#1ABC9C", "MEETUP": "#F64060", "ALS": "#2C3E50", 
+    "SCIENCES": "#1ABC9C", "MEETUP": "#F64060", "ALS": "#2C3E50",
     "MUSEUM": "#00A896", # Bleu d'eau pour l'Aquarium
+    "GNI": "#2980B9", "MEDEF": "#154360", "LORIA": "#6C3483", "ENACT": "#D35400", "OCTROI": "#27AE60",
     "DEFAULT": "#95A5A6"
 }
 
@@ -67,6 +70,26 @@ MONTHS_MAP = {
 # 2. FONCTIONS UTILITAIRES & NETTOYAGE
 # ==========================================
 DB_FILE = 'eventdata.json'
+CONFIG_FILE = 'config.json'
+SCRAPE_ERRORS = []  # réinitialisée à chaque rerun Streamlit
+ALL_SOURCES = ["Factuel", "Pépite", "Sciences", "Meetup", "ALS", "Museum", "GNI", "MEDEF", "LORIA", "ENACT", "Octroi"]
+SOURCE_ICONS = {
+    "Factuel": "📡", "Pépite": "🚀", "Sciences": "🔬", "Meetup": "🍻", "ALS": "🏛️", "Museum": "🐠",
+    "GNI": "🚀", "MEDEF": "💼", "LORIA": "🔬", "ENACT": "🤖", "Octroi": "🏭"
+}
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE): return {"sources_actives": ALL_SOURCES.copy()}
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+            cfg.setdefault("sources_actives", ALL_SOURCES.copy())
+            return cfg
+    except: return {"sources_actives": ALL_SOURCES.copy()}
+
+def save_config(cfg):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
 
 def load_db():
     if not os.path.exists(DB_FILE): return []
@@ -146,6 +169,45 @@ def save_new_events(new_events_list):
     return count
 
 # ==========================================
+# 2b. AJOUT AU CALENDRIER (Google Calendar)
+# ==========================================
+def parse_event_time(event):
+    """Retourne (debut, fin, journee_entiere) déduits de date_sort + dates_display, ou None si date inconnue."""
+    date_sort = event.get('date_sort', '2099-12-31')
+    if not date_sort or date_sort.startswith('2099'): return None
+    try:
+        base_date = datetime.strptime(date_sort, "%Y-%m-%d")
+    except: return None
+    txt = event.get('dates_display', '')
+    m = re.search(r'(\d{1,2})h(\d{2})\s*-\s*(\d{1,2})h(\d{2})', txt)
+    if m:
+        h1, mi1, h2, mi2 = m.groups()
+        return base_date.replace(hour=int(h1), minute=int(mi1)), base_date.replace(hour=int(h2), minute=int(mi2)), False
+    m = re.search(r'(\d{1,2}):(\d{2})', txt)
+    if m:
+        h, mi = m.groups()
+        start = base_date.replace(hour=int(h), minute=int(mi))
+        return start, start + timedelta(hours=2), False
+    return base_date, base_date + timedelta(days=1), True
+
+def google_calendar_url(event):
+    parsed = parse_event_time(event)
+    if not parsed: return None
+    start, end, all_day = parsed
+    if all_day:
+        dates = f"{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}"
+    else:
+        dates = f"{start.strftime('%Y%m%dT%H%M%S')}/{end.strftime('%Y%m%dT%H%M%S')}"
+    params = {
+        "action": "TEMPLATE",
+        "text": event.get('titre', ''),
+        "dates": dates,
+        "details": event.get('url', ''),
+        "location": event.get('lieu', ''),
+    }
+    return "https://www.google.com/calendar/render?" + urlencode(params)
+
+# ==========================================
 # 3. SCRAPERS
 # ==========================================
 def fetch_factuel_page(page_index):
@@ -166,7 +228,12 @@ def fetch_factuel_page(page_index):
                 if not url_evt.startswith('http'): url_evt = "https://factuel.univ-lorraine.fr" + url_evt
                 title = clean_text(a.select_one('h3, h2').get_text()) if a.select_one('h3, h2') else "Sans titre"
                 img_tag = a.select_one('img')
-                img_url = fix_img_url(img_tag.get('src') or img_tag.get('data-src')) if img_tag else ""
+                img_url = ""
+                if img_tag:
+                    # Le plugin de lazy-load met un GIF transparent en `src` et l'image réelle dans `data-src-img`.
+                    src = img_tag.get('data-src-img') or img_tag.get('data-src') or img_tag.get('src') or ""
+                    if src.startswith('data:'): src = ""
+                    img_url = fix_img_url(src)
                 type_tag = a.select_one('.type_evenements div, .field-name-field-type-evenement')
                 evt_type = clean_text(type_tag.get_text()).upper() if type_tag else "AGENDA"
                 lieu = clean_text(a.select_one('.lieu').get_text()) if a.select_one('.lieu') else ""
@@ -183,7 +250,9 @@ def fetch_factuel_page(page_index):
                 })
             except: continue
         return events
-    except: return []
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"Factuel (page {page_index+1}) : {e}")
+        return []
 
 def fetch_pepite_page(page_index):
     url = f"https://pepite-peel.pepitizy.fr/fr/pepites/events/pepite?page={page_index + 1}"
@@ -237,7 +306,9 @@ def fetch_pepite_page(page_index):
                 })
             except: continue
         return events
-    except: return []
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"Pépite (page {page_index+1}) : {e}")
+        return []
 
 def fetch_sciences_societe():
     url = "https://conferences-sciences-et-societe.univ-lorraine.fr/agenda/"
@@ -261,11 +332,13 @@ def fetch_sciences_societe():
                 if link:
                     titre = link.get_text(strip=True)
                     url_evt = link['href']
+                    if not url_evt.startswith('http'): url_evt = "https://conferences-sciences-et-societe.univ-lorraine.fr" + url_evt
                 else:
                     lines = [l for l in current.stripped_strings if len(l) > 10]
                     titre = lines[1] if len(lines) > 1 else "Conférence"
                     url_evt = url
-                img_url = "https://conferences-sciences-et-societe.univ-lorraine.fr/wp-content/themes/science-et-societe/images/logo-science-societe.png"
+                # La page agenda ne contient pas d'image par événement, on utilise le logo du site (les cartes n'ont pas de <img>)
+                img_url = "https://conferences-sciences-et-societe.univ-lorraine.fr/wp-content/uploads/2021/08/logo-science-societe.png"
                 if current.select_one('img'): img_url = current.select_one('img').get('src')
                 events.append({
                     "id": hashlib.md5((date_txt + titre).encode()).hexdigest(),
@@ -275,7 +348,9 @@ def fetch_sciences_societe():
                 })
             current = current.find_next_sibling()
         return events
-    except: return []
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"Sciences & Société : {e}")
+        return []
 
 def fetch_meetup_search():
     url = "https://www.meetup.com/find/?location=fr--Nancy&source=EVENTS&distance=tenMiles"
@@ -305,7 +380,10 @@ def fetch_meetup_search():
                 raw_dt = time_tag['datetime']
                 try:
                     if '[' in raw_dt: raw_dt = raw_dt.split('[')[0]
-                    dt = datetime.fromisoformat(raw_dt)
+                    # Meetup renvoie des chiffres en UTC malgré un suffixe de fuseau local (ex: "17:00:00+02:00[Europe/Paris]" affiche pourtant "19:00" sur le site) : on ignore l'offset fourni et on traite les chiffres bruts comme de l'UTC.
+                    raw_naive = re.sub(r'(Z|[+-]\d{2}:\d{2})$', '', raw_dt)
+                    dt_utc = datetime.fromisoformat(raw_naive).replace(tzinfo=ZoneInfo("UTC"))
+                    dt = dt_utc.astimezone(ZoneInfo("Europe/Paris"))
                     day = dt.strftime("%d")
                     month = dt.strftime("%m")
                     year = dt.strftime("%Y")
@@ -341,7 +419,9 @@ def fetch_meetup_search():
                 "image": image_url, "url": url_clean, "reservation": True, "statut": "nouveau"
             })
         return events
-    except: return []
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"Meetup : {e}")
+        return []
 
 def fetch_als():
     url = "https://als.univ-lorraine.fr/seances-futures/"
@@ -363,7 +443,12 @@ def fetch_als():
                 if len(real_title) > 150: real_title = real_title[:150] + "..."
                 link = a.find('a')
                 url_evt = link['href'] if link else url
-                img_url = "https://als.univ-lorraine.fr/wp-content/uploads/2016/02/Logo-ALS-seul.png"
+                # Le lazy-load met un SVG placeholder en `src`, l'image réelle est dans `data-src`
+                img_tag = a.select_one('img')
+                img_url = "https://als.univ-lorraine.fr/wp-content/uploads/2023/12/logo-ALS-214.png"
+                if img_tag:
+                    src = img_tag.get('data-src') or img_tag.get('src') or ""
+                    if src and not src.startswith('data:'): img_url = src
                 events.append({
                     "id": hashlib.md5((date_full + real_title).encode()).hexdigest(),
                     "source": "ALS", "type": "CONFÉRENCE", "titre": clean_text(real_title), 
@@ -372,7 +457,9 @@ def fetch_als():
                     "image": img_url, "url": url_evt, "reservation": False, "statut": "nouveau"
                 })
         return events
-    except: return []
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"ALS : {e}")
+        return []
 
 # --- 6. MUSEUM-AQUARIUM (NOUVEAU) ---
 def fetch_museum_aquarium():
@@ -457,9 +544,176 @@ def fetch_museum_aquarium():
                 "dates_display": date_display, "date_sort": sort_date,
                 "image": img_url, "url": url_evt, "reservation": False, "statut": "nouveau"
             })
-            
+
         return events
-    except: return []
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"Muséum-Aquarium : {e}")
+        return []
+
+
+# --- 7. GRAND NANCY INNOVATION (incubateur/accélérateur) ---
+def fetch_grand_nancy_innovation():
+    url = "https://grandnancy-innovation.eu/evenements/"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        articles = soup.select('article')
+        events = []
+        current_year = datetime.now().year
+        for a in articles:
+            try:
+                link = a.select_one('h3.title a') or a.select_one('a.entire-meta-link')
+                if not link: continue
+                url_evt = link['href']
+                # Titre au format "Nom | DD Mois | HHh-HHh" — l'archive mélange événements passés et futurs
+                # sans année fiable (ex: "CYBER DAY 2025" republié en 2026), donc on ne devine pas l'année :
+                # année en cours par défaut, les événements déjà passés seront purgés au prochain rechargement.
+                parts = [p.strip() for p in clean_text(link.get_text()).split('|')]
+                titre = parts[0]
+                date_txt, sort_date = "Date à voir", "2099-12-31"
+                if len(parts) > 1:
+                    date_match = re.search(r'(\d{1,2})\s+([^\d\s]+)', parts[1].lower())
+                    if date_match:
+                        day, month_str = date_match.groups()
+                        month_num = MONTHS_MAP.get(month_str)
+                        if month_num:
+                            sort_date = f"{current_year}-{month_num}-{day.zfill(2)}"
+                            time_match = re.search(r'(\d{1,2})[hH](\d{2})?\s*[-–]\s*(\d{1,2})[hH](\d{2})?', parts[2] if len(parts) > 2 else parts[1])
+                            if time_match:
+                                h1, m1, h2, m2 = time_match.groups()
+                                date_txt = f"{day.zfill(2)}/{month_num}/{current_year} | {h1}h{m1 or '00'} - {h2}h{m2 or '00'}"
+                            else:
+                                date_txt = f"{day.zfill(2)}/{month_num}/{current_year}"
+                img_tag = a.select_one('img')
+                img_url = fix_img_url(img_tag.get('src')) if img_tag and img_tag.get('src') else ""
+                events.append({
+                    "id": hashlib.md5(url_evt.encode()).hexdigest(),
+                    "source": "GNI", "type": "INNOVATION", "titre": titre, "lieu": "Grand Nancy Innovation",
+                    "dates_display": date_txt, "date_sort": sort_date,
+                    "image": img_url, "url": url_evt, "reservation": False, "statut": "nouveau"
+                })
+            except: continue
+        return events
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"Grand Nancy Innovation : {e}")
+        return []
+
+# --- 8. MEDEF MEURTHE-ET-MOSELLE ---
+def fetch_medef_54():
+    url = "https://www.medef-meurthe-moselle.fr/fr/agenda"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        items = soup.select('.Grid-item')
+        events = []
+        for item in items:
+            try:
+                if 'isPast' in (item.get('class') or []): continue
+                link = item.select_one('a.globalLink')
+                if not link: continue
+                url_evt = link['href']
+                if not url_evt.startswith('http'): url_evt = "https://www.medef-meurthe-moselle.fr" + url_evt
+                title_tag = item.select_one('.Box-info-title')
+                date_tag = item.select_one('.Box-date')
+                if not title_tag or not date_tag: continue
+                date_match = re.search(r'(\d{1,2})\s+([^\d\s]+)\s+(\d{4})', date_tag.get_text(' ', strip=True).lower())
+                if not date_match: continue
+                day, month_str, year = date_match.groups()
+                month_num = MONTHS_MAP.get(month_str.rstrip('.'))
+                if not month_num: continue
+                cover = item.select_one('.Post-cover')
+                img_url = ""
+                if cover and cover.get('style'):
+                    m = re.search(r"url\(['\"]?([^'\"\)]+)['\"]?\)", cover['style'])
+                    if m and 'default.svg' not in m.group(1):
+                        src = m.group(1)
+                        img_url = src if src.startswith('http') else "https://www.medef-meurthe-moselle.fr" + src
+                events.append({
+                    "id": hashlib.md5(url_evt.encode()).hexdigest(),
+                    "source": "MEDEF", "type": "ENTREPRENEURIAT", "titre": clean_text(title_tag.get_text()), "lieu": "MEDEF Meurthe-et-Moselle",
+                    "dates_display": f"{day.zfill(2)}/{month_num}/{year}", "date_sort": f"{year}-{month_num}-{day.zfill(2)}",
+                    "image": img_url, "url": url_evt, "reservation": False, "statut": "nouveau"
+                })
+            except: continue
+        return events
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"MEDEF 54 : {e}")
+        return []
+
+# --- 9. AGENDAS "THE EVENTS CALENDAR" (LORIA / ENACT) ---
+def fetch_tribe_events(url, source, evt_type, lieu_default):
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        articles = soup.select('article.tribe-events-calendar-list__event')
+        events = []
+        for a in articles:
+            try:
+                link = a.select_one('.tribe-events-calendar-list__event-title-link')
+                time_tag = a.select_one('time.tribe-events-calendar-list__event-datetime')
+                if not link or not time_tag or not time_tag.get('datetime'): continue
+                url_evt = link['href']
+                venue = a.select_one('.tribe-events-calendar-list__event-venue-address')
+                lieu = clean_text(venue.get_text()) if venue else lieu_default
+                img_tag = a.select_one('img')
+                img_url = img_tag.get('src') if img_tag and img_tag.get('src') else ""
+                events.append({
+                    "id": hashlib.md5(url_evt.encode()).hexdigest(),
+                    "source": source, "type": evt_type, "titre": clean_text(link.get_text()), "lieu": lieu,
+                    "dates_display": time_tag.get_text(' ', strip=True).replace('@', '|'), "date_sort": time_tag['datetime'][:10],
+                    "image": img_url, "url": url_evt, "reservation": False, "statut": "nouveau"
+                })
+            except: continue
+        return events
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"{source} : {e}")
+        return []
+
+def fetch_loria():
+    return fetch_tribe_events("https://www.loria.fr/events/", "LORIA", "RECHERCHE", "LORIA, Nancy")
+
+def fetch_enact():
+    return fetch_tribe_events("https://cluster-ia-enact.ai/events/", "ENACT", "INNOVATION IA", "Grand Est")
+
+# --- 10. L'OCTROI-NANCY (tiers-lieu, via Tibillet) ---
+def fetch_octroi():
+    url = "https://association-lok3.tibillet.coop/event/"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        links = soup.select('a[href*="/event/"]')
+        events = []
+        seen = set()
+        for link in links:
+            try:
+                url_evt = link['href']
+                if not url_evt.startswith('http'): url_evt = "https://association-lok3.tibillet.coop" + url_evt
+                if url_evt in seen: continue
+                m = re.search(r'-(\d{2})(\d{2})(\d{2})-(\d{2})(\d{2})-[0-9a-f]{6,}/?$', url_evt)
+                if not m: continue
+                titre = clean_text(link.get_text())
+                if not titre: continue
+                seen.add(url_evt)
+                yy, mm, dd, hh, mi = m.groups()
+                # Le lieu suit l'icône géo dans la carte ; certaines cartes (événements de partenaires) ont un bloc
+                # description avant, donc on cible l'icône plutôt que le div suivant directement le lien.
+                lieu = "L'Octroi-Nancy"
+                card = link.find_parent('div', class_='col') or link.parent
+                geo_icon = card.select_one('i.bi-geo-alt-fill') if card else None
+                if geo_icon:
+                    loc_parts = [a2.get_text(strip=True) for a2 in geo_icon.find_next_siblings('a')]
+                    if loc_parts: lieu = ", ".join(loc_parts)
+                events.append({
+                    "id": hashlib.md5(url_evt.encode()).hexdigest(),
+                    "source": "OCTROI", "type": "TIERS-LIEU", "titre": titre, "lieu": lieu,
+                    "dates_display": f"{dd}/{mm}/20{yy} | {hh}:{mi}", "date_sort": f"20{yy}-{mm}-{dd}",
+                    "image": "", "url": url_evt, "reservation": False, "statut": "nouveau"
+                })
+            except: continue
+        return events
+    except Exception as e:
+        SCRAPE_ERRORS.append(f"L'Octroi-Nancy : {e}")
+        return []
 
 
 # --- ROUTEUR ---
@@ -476,6 +730,11 @@ def scan_source(source_name):
     elif source_name == "Meetup": return fetch_meetup_search()
     elif source_name == "ALS": return fetch_als()
     elif source_name == "Museum": return fetch_museum_aquarium() # Nouvelle entrée
+    elif source_name == "GNI": return fetch_grand_nancy_innovation()
+    elif source_name == "MEDEF": return fetch_medef_54()
+    elif source_name == "LORIA": return fetch_loria()
+    elif source_name == "ENACT": return fetch_enact()
+    elif source_name == "Octroi": return fetch_octroi()
     return []
 
 # ==========================================
@@ -500,6 +759,11 @@ def render_card(event):
     elif source == "MEETUP": badge_color = "#F64060"
     elif source == "ALS": badge_color = "#2c3e50"
     elif source == "MUSEUM": badge_color = "#00A896"
+    elif source == "GNI": badge_color = "#2980B9"
+    elif source == "MEDEF": badge_color = "#154360"
+    elif source == "LORIA": badge_color = "#6C3483"
+    elif source == "ENACT": badge_color = "#D35400"
+    elif source == "OCTROI": badge_color = "#27AE60"
     
     img_html = f'<img src="{img}" class="event-img" onerror="this.onerror=null;this.src=\'https://placehold.co/240x250/eee/999?text=Image\';">' if img else '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:3em;">📅</div>'
     resa = '<div class="info-row" style="color:#e67e22; font-weight:600;"><span class="icon">🎫</span>Sur réservation</div>' if event.get('reservation') else ""
@@ -535,41 +799,61 @@ cleaned_count = auto_clean_old_events()
 if cleaned_count > 0:
     st.toast(f"🧹 Nettoyage : {cleaned_count} événements passés supprimés.", icon="🗑️")
 
+config = load_config()
+
+with st.expander("⚙️ Sources actives (utilisées par « Scanner Tout »)"):
+    actives = st.multiselect("Sources à scanner", ALL_SOURCES, default=config.get("sources_actives", ALL_SOURCES), label_visibility="collapsed")
+    if actives != config.get("sources_actives"):
+        config["sources_actives"] = actives
+        save_config(config)
+
 c1, c2, c3 = st.columns([2, 1, 1])
-with c1: st.caption("Centralisateur : Université, Pépite, Sciences, Meetup, ALS & Muséum.")
+with c1: st.caption("Centralisateur : Université, Pépite, Sciences, Meetup, ALS, Muséum & Entrepreneuriat (GNI, MEDEF, LORIA, ENACT, Octroi).")
 with c2:
     if st.button("🌍 Scanner Tout", type="primary", use_container_width=True):
-        with st.status("Scan général...", expanded=True) as status:
-            st.write("📡 Factuel..."); evts = scan_source("Factuel")
-            st.write("🚀 Pépite..."); evts += scan_source("Pépite")
-            st.write("🔬 Sciences..."); evts += scan_source("Sciences")
-            st.write("🍻 Meetup..."); evts += scan_source("Meetup")
-            st.write("🏛️ ALS..."); evts += scan_source("ALS")
-            st.write("🐠 Muséum..."); evts += scan_source("Museum")
-            n = save_new_events(evts)
-            status.update(label="Terminé !", state="complete", expanded=False)
-        if n: st.success(f"+{n} events !"); time.sleep(1); st.rerun()
-        else: st.info("Rien de neuf.")
+        actives = config.get("sources_actives", ALL_SOURCES)
+        if not actives:
+            st.warning("Aucune source active — choisis-en dans « ⚙️ Sources actives » ci-dessus.")
+        else:
+            with st.status("Scan général...", expanded=True) as status:
+                evts = []
+                for s in actives:
+                    st.write(f"{SOURCE_ICONS.get(s, '🔎')} {s}..."); evts += scan_source(s)
+                n = save_new_events(evts)
+                if SCRAPE_ERRORS:
+                    status.update(label=f"Terminé avec {len(SCRAPE_ERRORS)} erreur(s)", state="error", expanded=True)
+                else:
+                    status.update(label="Terminé !", state="complete", expanded=False)
+            for err in SCRAPE_ERRORS: st.error(f"⚠️ {err}")
+            if n: st.success(f"+{n} events !"); time.sleep(1); st.rerun()
+            elif not SCRAPE_ERRORS: st.info("Rien de neuf.")
 
 with c3:
-    src = st.selectbox("Source :", ["Factuel", "Pépite", "Sciences", "Meetup", "ALS", "Museum"], label_visibility="collapsed")
+    src = st.selectbox("Source :", ALL_SOURCES, label_visibility="collapsed")
     if st.button(f"Scanner {src}", use_container_width=True):
         with st.spinner(f"Scan {src}..."):
             n = save_new_events(scan_source(src))
+        for err in SCRAPE_ERRORS: st.error(f"⚠️ {err}")
         if n: st.success(f"+{n} ajouts !"); time.sleep(1); st.rerun()
-        else: st.info("À jour.")
+        elif not SCRAPE_ERRORS: st.info("À jour.")
 
 st.divider()
 
 events = load_db()
 new = [e for e in events if e['statut']=='nouveau']
-kept = [e for e in events if e['statut']=='valide']
 trash = [e for e in events if e['statut']=='poubelle']
 
-t1, t2, t3 = st.tabs([f"À Trier ({len(new)})", f"Ma Liste ({len(kept)})", f"Poubelle ({len(trash)})"])
+t1, t2 = st.tabs([f"À Trier ({len(new)})", f"Poubelle ({len(trash)})"])
 
 with t1:
     new.sort(key=lambda x: x.get('date_sort', '9999'))
+    if new:
+        f1, f2 = st.columns(2)
+        sources_dispo = sorted({e['source'] for e in new})
+        types_dispo = sorted({e['type'] for e in new})
+        f_sources = f1.multiselect("Filtrer par source", sources_dispo, default=sources_dispo)
+        f_types = f2.multiselect("Filtrer par type", types_dispo, default=types_dispo)
+        new = [e for e in new if e['source'] in f_sources and e['type'] in f_types]
     if not new: st.info("Vide.")
     for i in range(0, len(new), 2):
         cols = st.columns(2)
@@ -580,20 +864,13 @@ with t1:
                     render_card(e)
                     b1, b2 = st.columns(2)
                     if b1.button("Passer", key=f"d_{e['id']}"): update_status(e['id'], 'poubelle'); st.rerun()
-                    if b2.button("Garder", key=f"k_{e['id']}"): update_status(e['id'], 'valide'); st.rerun()
+                    gcal_url = google_calendar_url(e)
+                    if gcal_url:
+                        b2.link_button("🗓️ Google Agenda", gcal_url, use_container_width=True)
+                    else:
+                        b2.caption("⚠️ Date inconnue")
 
 with t2:
-    kept.sort(key=lambda x: x.get('date_sort', '9999'))
-    for i in range(0, len(kept), 2):
-        cols = st.columns(2)
-        for j in range(2):
-            if i+j < len(kept):
-                e = kept[i+j]
-                with cols[j]:
-                    render_card(e)
-                    if st.button("Retirer", key=f"rm_{e['id']}"): update_status(e['id'], 'poubelle'); st.rerun()
-
-with t3:
     st.caption("Les événements ici sont supprimés automatiquement 7 jours après leur date.")
     for i in range(0, len(trash), 2):
         cols = st.columns(2)
